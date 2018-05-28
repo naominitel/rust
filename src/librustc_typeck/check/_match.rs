@@ -27,38 +27,34 @@ use syntax::ptr::P;
 use syntax_pos::Span;
 
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
-    fn demand_autoderef(&self, sp: Span, expected: Ty<'tcx>, mut actual: Ty<'tcx>, subtype: bool) {
+    fn demand_autoderef(&self, sp: Span, mut expected: Ty<'tcx>, actual: Ty<'tcx>, subtype: bool) {
         let mut pat_adjustments = vec![];
         let mut _exp_ty = self.resolve_type_vars_with_obligations(&expected);
         let mut autoderef = self.autoderef(sp, expected);
+        info!("demand_autoderef expected = {:?}, actual = {:?}", expected, actual);
 
         loop {
             let result =
                 if subtype { self.demand_suptype_diag(sp, expected, actual) }
                 else { self.demand_eqtype_diag(sp, expected, actual) };
             match result {
-                None => break,
+                None => {
+                    info!("demand_autoderef succeed");
+                    break;
+                }
                 Some(mut diag) => {
                     // doesn't unify, auto-deref and try again
-                    match actual.sty {
-                        ty::TypeVariants::TyRef(_, _inner_ty, _inner_mutability) => {
-                            pat_adjustments.push(actual);
+                    pat_adjustments.push(actual);
 
-                            if autoderef.next().is_some() {
-                                let adjusted_ty = autoderef.unambiguous_final_ty();
-                                debug!("adjusted_ty = {:?}", adjusted_ty);
-                                actual = adjusted_ty;
-                            } else {
-                                // no possibility to auto-deref
-                                diag.emit();
-                                return;
-                            }
-                        },
-                        _ => {
-                            // no possibility to auto-deref
-                            diag.emit();
-                            return;
-                        }
+                    if autoderef.next().is_some() {
+                        let adjusted_ty = autoderef.unambiguous_final_ty();
+                        info!("adjusted_ty = {:?}", adjusted_ty);
+                        expected = adjusted_ty;
+                        diag.cancel();
+                    } else {
+                        // no possibility to auto-deref
+                        diag.emit();
+                        return;
                     }
                 }
             }
