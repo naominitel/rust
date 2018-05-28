@@ -38,5 +38,7 @@ fn with_bytes() {
 }
 
 pub fn main() {
+    with_u8();
     with_str();
+    with_bytes();
 }

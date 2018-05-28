@@ -27,21 +27,21 @@ use syntax::ptr::P;
 use syntax_pos::Span;
 
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
-    fn demand_autoderef(&self, sp: Span, expected: Ty<'tcx>, actual: Ty<'tcx>, subtype: bool) {
-        let mut pat_adjustmets = vec![];
-        let mut exp_ty = self.resolve_type_vars_with_obligations(&expected);
-        let mut autoderef = self.autoderef(pat.span, expected);
+    fn demand_autoderef(&self, sp: Span, expected: Ty<'tcx>, mut actual: Ty<'tcx>, subtype: bool) {
+        let mut pat_adjustments = vec![];
+        let mut _exp_ty = self.resolve_type_vars_with_obligations(&expected);
+        let mut autoderef = self.autoderef(sp, expected);
 
         loop {
             let result =
-                if subtype { self.demand_subtype_diag(sp, expected, actual) }
+                if subtype { self.demand_suptype_diag(sp, expected, actual) }
                 else { self.demand_eqtype_diag(sp, expected, actual) };
             match result {
                 None => break,
-                Some(diag) => {
+                Some(mut diag) => {
                     // doesn't unify, auto-deref and try again
-                    match actual {
-                        ty::TypeVariants::TyRef(_, inner_ty, inner_mutability) => {
+                    match actual.sty {
+                        ty::TypeVariants::TyRef(_, _inner_ty, _inner_mutability) => {
                             pat_adjustments.push(actual);
 
                             if autoderef.next().is_some() {
@@ -50,9 +50,14 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                 actual = adjusted_ty;
                             } else {
                                 // no possibility to auto-deref
-                                e.emit();
+                                diag.emit();
                                 return;
                             }
+                        },
+                        _ => {
+                            // no possibility to auto-deref
+                            diag.emit();
+                            return;
                         }
                     }
                 }
@@ -67,8 +72,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     pub fn check_pat_walk(
         &self,
         pat: &'gcx hir::Pat,
-        mut expected: Ty<'tcx>,
-        mut def_bm: ty::BindingMode,
+        expected: Ty<'tcx>,
+        def_bm: ty::BindingMode,
         is_arg: bool)
     {
         let tcx = self.tcx;
@@ -76,31 +81,6 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         debug!("check_pat_walk(pat={:?},expected={:?},def_bm={:?},is_arg={})",
             pat, expected, def_bm, is_arg);
 
-        let is_non_ref_pat = match pat.node {
-            PatKind::Struct(..) |
-            PatKind::TupleStruct(..) |
-            PatKind::Tuple(..) |
-            PatKind::Box(_) |
-            PatKind::Range(..) |
-            PatKind::Slice(..) => true,
-            PatKind::Lit(ref lt) => {
-                let ty = self.check_expr(lt);
-                match ty.sty {
-                    ty::TypeVariants::TyRef(..) => false,
-                    _ => true,
-                }
-            }
-            PatKind::Path(ref qpath) => {
-                let (def, _, _) = self.resolve_ty_and_def_ufcs(qpath, pat.id, pat.span);
-                match def {
-                    Def::Const(..) | Def::AssociatedConst(..) => false,
-                    _ => true,
-                }
-            }
-            PatKind::Wild |
-            PatKind::Binding(..) |
-            PatKind::Ref(..) => false,
-        };
         // if is_non_ref_pat {
         //     debug!("pattern is non reference pattern");
         //     let mut exp_ty = self.resolve_type_vars_with_obligations(&expected);
@@ -167,7 +147,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // }
 
         // Lose mutability now that we know binding mode and discriminant type.
-        let bm_def = def_bm;
+        let _bm_def = def_bm;
         let expected = expected;
 
         let ty = match pat.node {
@@ -207,8 +187,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 //
                 // that's equivalent to there existing a LUB.
                 match ty.sty {
-                    ty::TyVariantKind::TyRef(..) => self.demand_subtype(pat.span, expected, pat_ty),
-                    _ => self.demand_autoderef(pat.span, expected, pat_ty, true);
+                    ty::TypeVariants::TyRef(..) => self.demand_suptype(pat.span, expected, pat_ty),
+                    _ => self.demand_autoderef(pat.span, expected, pat_ty, true),
                 }
 
                 pat_ty
