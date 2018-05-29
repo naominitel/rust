@@ -27,16 +27,18 @@ use syntax::ptr::P;
 use syntax_pos::Span;
 
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
-    fn demand_autoderef(&self, pat: &hir::Pat, mut expected: Ty<'tcx>, actual: Ty<'tcx>, subtype: bool) {
+    fn demand_autoderef(&self, pat: &hir::Pat,
+                        expected: Ty<'tcx>, actual: Ty<'tcx>,
+                        def_bm: &mut ty::BindingMode, subtype: bool) {
         let mut pat_adjustments = vec![];
-        let mut _exp_ty = self.resolve_type_vars_with_obligations(&expected);
-        let mut autoderef = self.autoderef(pat.span, expected);
-        info!("demand_autoderef expected = {:?}, actual = {:?}", expected, actual);
+        let mut exp_ty = self.resolve_type_vars_with_obligations(&expected);
+        let mut autoderef = self.autoderef(pat.span, exp_ty);
+        info!("demand_autoderef expected = {:?}, actual = {:?}", exp_ty, actual);
 
         loop {
             let result =
-                if subtype { self.demand_suptype_diag(pat.span, expected, actual) }
-                else { self.demand_eqtype_diag(pat.span, expected, actual) };
+                if subtype { self.demand_suptype_diag(pat.span, exp_ty, actual) }
+            else { self.demand_eqtype_diag(pat.span, exp_ty, actual) };
             match result {
                 None => {
                     info!("demand_autoderef succeed");
@@ -44,13 +46,43 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 }
                 Some(mut diag) => {
                     // doesn't unify, auto-deref and try again
-                    pat_adjustments.push(expected);
+                    pat_adjustments.push(exp_ty);
 
-                    if autoderef.next().is_some() {
-                        let adjusted_ty = autoderef.unambiguous_final_ty();
-                        info!("adjusted_ty = {:?}", adjusted_ty);
-                        expected = adjusted_ty;
-                        diag.cancel();
+                    info!("trying adjustment");
+                    match exp_ty.sty {
+                        ty::TypeVariants::TyRef(_, _inner_ty, inner_mut) => {
+                            *def_bm = match *def_bm {
+                                // If default binding mode is by value, make it `ref` or `ref mut`
+                                // (depending on whether we observe `&` or `&mut`).
+                                ty::BindByValue(_) =>
+                                    ty::BindByReference(inner_mut),
+
+                                // Once a `ref`, always a `ref`. This is because a `& &mut` can't mutate
+                                // the underlying value.
+                                ty::BindByReference(hir::Mutability::MutImmutable) =>
+                                    ty::BindByReference(hir::Mutability::MutImmutable),
+
+                                // When `ref mut`, stay a `ref mut` (on `&mut`) or downgrade to `ref`
+                                // (on `&`).
+                                ty::BindByReference(hir::Mutability::MutMutable) =>
+                                    ty::BindByReference(inner_mut),
+                            };
+                            info!("bm now in ref mode");
+                        }
+                        _ => ()
+                    }
+
+                    if let ty::BindByReference(_) = *def_bm {
+                        if autoderef.next().is_some() {
+                            let adjusted_ty = autoderef.unambiguous_final_ty();
+                            info!("adjusted_ty = {:?}", adjusted_ty);
+                            exp_ty = adjusted_ty;
+                            diag.cancel();
+                        } else {
+                            // no possibility to auto-deref
+                            diag.emit();
+                            return;
+                        }
                     } else {
                         // no possibility to auto-deref
                         diag.emit();
@@ -76,7 +108,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         &self,
         pat: &'gcx hir::Pat,
         expected: Ty<'tcx>,
-        def_bm: ty::BindingMode,
+        mut def_bm: ty::BindingMode,
         is_arg: bool)
     {
         let tcx = self.tcx;
@@ -84,73 +116,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         debug!("check_pat_walk(pat={:?},expected={:?},def_bm={:?},is_arg={})",
             pat, expected, def_bm, is_arg);
 
-        // if is_non_ref_pat {
-        //     debug!("pattern is non reference pattern");
-        //     let mut exp_ty = self.resolve_type_vars_with_obligations(&expected);
-
-        //     // Peel off as many `&` or `&mut` from the discriminant as possible. For example,
-        //     // for `match &&&mut Some(5)` the loop runs three times, aborting when it reaches
-        //     // the `Some(5)` which is not of type TyRef.
-        //     //
-        //     // For each ampersand peeled off, update the binding mode and push the original
-        //     // type into the adjustments vector.
-        //     //
-        //     // See the examples in `run-pass/match-defbm*.rs`.
-        //     let mut pat_adjustments = vec![];
-        //     let mut autoderef self.autoderef(pat.span, exp_ty);
-
-        //     expected = loop {
-        //         debug!("inspecting {:?} with type {:?}", exp_ty, exp_ty.sty);
-        //         match exp_ty.sty {
-        //             ty::TypeVariants::TyRef(_, inner_ty, inner_mutability) => {
-        //                 debug!("current discriminant is TyRef, inserting implicit deref");
-        //                 // Preserve the reference type. We'll need it later during HAIR lowering.
-        //                 pat_adjustments.push(exp_ty);
-
-        //                 exp_ty = inner_ty;
-        //                 def_bm = match def_bm {
-        //                     // If default binding mode is by value, make it `ref` or `ref mut`
-        //                     // (depending on whether we observe `&` or `&mut`).
-        //                     ty::BindByValue(_) =>
-        //                         ty::BindByReference(inner_mutability),
-
-        //                     // Once a `ref`, always a `ref`. This is because a `& &mut` can't mutate
-        //                     // the underlying value.
-        //                     ty::BindByReference(hir::Mutability::MutImmutable) =>
-        //                         ty::BindByReference(hir::Mutability::MutImmutable),
-
-        //                     // When `ref mut`, stay a `ref mut` (on `&mut`) or downgrade to `ref`
-        //                     // (on `&`).
-        //                     ty::BindByReference(hir::Mutability::MutMutable) =>
-        //                         ty::BindByReference(inner_mutability),
-        //                 };
-        //             },
-        //             _ => break exp_ty,
-        //         }
-        //     };
-        //     if pat_adjustments.len() > 0 {
-        //         debug!("default binding mode is now {:?}", def_bm);
-        //         self.inh.tables.borrow_mut()
-        //             .pat_adjustments_mut()
-        //             .insert(pat.hir_id, pat_adjustments);
-        //     }
-        // } else if let PatKind::Ref(..) = pat.node {
-        //     // When you encounter a `&pat` pattern, reset to "by
-        //     // value". This is so that `x` and `y` here are by value,
-        //     // as they appear to be:
-        //     //
-        //     // ```
-        //     // match &(&22, &44) {
-        //     //   (&x, &y) => ...
-        //     // }
-        //     // ```
-        //     //
-        //     // cc #46688
-        //     def_bm = ty::BindByValue(hir::MutImmutable);
-        // }
-
         // Lose mutability now that we know binding mode and discriminant type.
-        let _bm_def = def_bm;
         let expected = expected;
 
         let ty = match pat.node {
@@ -191,7 +157,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // that's equivalent to there existing a LUB.
                 match ty.sty {
                     ty::TypeVariants::TyRef(..) => self.demand_suptype(pat.span, expected, pat_ty),
-                    _ => self.demand_autoderef(&pat, expected, pat_ty, true),
+                    _ => self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, true),
                 }
 
                 pat_ty
@@ -241,8 +207,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 let common_type = self.resolve_type_vars_if_possible(&lhs_ty);
 
                 // subtyping doesn't matter here, as the value is some kind of scalar
-                self.demand_autoderef(pat, expected, lhs_ty, false);
-                self.demand_autoderef(pat, expected, rhs_ty, false);
+                self.demand_autoderef(pat, expected, lhs_ty, &mut def_bm, false);
+                self.demand_autoderef(pat, expected, rhs_ty, &mut def_bm, false);
                 common_type
             }
             PatKind::Binding(ba, var_id, _, ref sub) => {
@@ -297,7 +263,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 self.check_pat_tuple_struct(pat, qpath, &subpats, ddpos, expected, def_bm)
             }
             PatKind::Path(ref qpath) => {
-                self.check_pat_path(pat, qpath, expected)
+                self.check_pat_path(pat, qpath, expected, def_bm)
             }
             PatKind::Struct(ref qpath, ref fields, etc) => {
                 self.check_pat_struct(pat, qpath, fields, etc, expected, def_bm)
@@ -319,7 +285,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                     TypeVariableOrigin::TypeInference(pat.span)));
                 let element_tys = tcx.mk_type_list(element_tys_iter);
                 let pat_ty = tcx.mk_ty(ty::TyTuple(element_tys));
-                self.demand_autoderef(pat, expected, pat_ty, false);
+                self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, false);
                 for (i, elem) in elements.iter().enumerate_and_adjust(max_len, ddpos) {
                     self.check_pat_walk(elem, &element_tys[i], def_bm, true);
                 }
@@ -333,7 +299,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                     // Here, `demand::subtype` is good enough, but I don't
                     // think any errors can be introduced by using
                     // `demand::eqtype`.
-                    self.demand_autoderef(pat, expected, uniq_ty, false);
+                    self.demand_autoderef(pat, expected, uniq_ty, &mut def_bm, false);
                     self.check_pat_walk(&inner, inner_ty, def_bm, true);
                     uniq_ty
                 } else {
@@ -342,6 +308,19 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 }
             }
             PatKind::Ref(ref inner, mutbl) => {
+                // When you encounter a `&pat` pattern, reset to "by
+                // value". This is so that `x` and `y` here are by value,
+                // as they appear to be:
+                //
+                // ```
+                // match &(&22, &44) {
+                //   (&x, &y) => ...
+                // }
+                // ```
+                //
+                // cc #46688
+                def_bm = ty::BindByValue(hir::MutImmutable);
+
                 let expected = self.shallow_resolve(expected);
                 if self.check_dereferencable(pat.span, expected, &inner) {
                     // `demand::subtype` would be good enough, but using
@@ -727,7 +706,7 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
                         fields: &'gcx [Spanned<hir::FieldPat>],
                         etc: bool,
                         expected: Ty<'tcx>,
-                        def_bm: ty::BindingMode) -> Ty<'tcx>
+                        mut def_bm: ty::BindingMode) -> Ty<'tcx>
     {
         // Resolve the path and check the definition for errors.
         let (variant, pat_ty) = if let Some(variant_ty) = self.check_struct_path(qpath, pat.id) {
@@ -740,7 +719,7 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
         };
 
         // Type check the path.
-        self.demand_autoderef(pat, expected, pat_ty, false);
+        self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, false);
 
         // Type check subpatterns.
         self.check_struct_pat_fields(pat_ty, pat.id, pat.span, variant, fields, etc, def_bm);
@@ -750,7 +729,8 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
     fn check_pat_path(&self,
                       pat: &hir::Pat,
                       qpath: &hir::QPath,
-                      expected: Ty<'tcx>) -> Ty<'tcx>
+                      expected: Ty<'tcx>,
+                      mut def_bm: ty::BindingMode) -> Ty<'tcx>
     {
         let tcx = self.tcx;
         let report_unexpected_def = |def: Def| {
@@ -780,8 +760,9 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
         // Type check the path.
         let pat_ty = self.instantiate_value_path(segments, opt_ty, def, pat.span, pat.id);
         match def {
-            Def::Const(..) | Def::AssociatedConst(..) => self.demand_suptype(pat.span, expected, pat_ty),
-            _ => self.demand_autoderef(pat, expected, pat_ty, true)
+            Def::Const(..) | Def::AssociatedConst(..) =>
+                self.demand_suptype(pat.span, expected, pat_ty),
+            _ => self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, true)
         }
         pat_ty
     }
@@ -792,21 +773,21 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
                               subpats: &'gcx [P<hir::Pat>],
                               ddpos: Option<usize>,
                               expected: Ty<'tcx>,
-                              def_bm: ty::BindingMode) -> Ty<'tcx>
+                              mut def_bm: ty::BindingMode) -> Ty<'tcx>
     {
         let tcx = self.tcx;
-        let on_error = || {
+        let on_error = |def_bm| {
             for pat in subpats {
                 self.check_pat_walk(&pat, tcx.types.err, def_bm, true);
             }
         };
-        let report_unexpected_def = |def: Def| {
+        let report_unexpected_def = |def: Def, def_bm| {
             let msg = format!("expected tuple struct/variant, found {} `{}`",
                               def.kind_name(),
                               hir::print::to_string(&tcx.hir, |s| s.print_qpath(qpath, false)));
             struct_span_err!(tcx.sess, pat.span, E0164, "{}", msg)
                 .span_label(pat.span, "not a tuple variant or struct").emit();
-            on_error();
+            on_error(def_bm);
         };
 
         // Resolve the path and check the definition for errors.
@@ -814,11 +795,11 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
         let variant = match def {
             Def::Err => {
                 self.set_tainted_by_errors();
-                on_error();
+                on_error(def_bm);
                 return tcx.types.err;
             }
             Def::AssociatedConst(..) | Def::Method(..) => {
-                report_unexpected_def(def);
+                report_unexpected_def(def, def_bm);
                 return tcx.types.err;
             }
             Def::VariantCtor(_, CtorKind::Fn) |
@@ -834,7 +815,7 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
         let pat_ty = pat_ty.fn_sig(tcx).output();
         let pat_ty = pat_ty.no_late_bound_regions().expect("expected fn type");
 
-        self.demand_autoderef(pat, expected, pat_ty, false);
+        self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, false);
 
         // Type check subpatterns.
         if subpats.len() == variant.fields.len() ||
@@ -859,7 +840,7 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
                 .span_label(pat.span, format!("expected {} field{}, found {}",
                                                variant.fields.len(), fields_ending, subpats.len()))
                 .emit();
-            on_error();
+            on_error(def_bm);
             return tcx.types.err;
         }
         pat_ty
