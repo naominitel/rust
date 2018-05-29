@@ -156,11 +156,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 //     &'static str <: expected
                 //
                 // that's equivalent to there existing a LUB.
-                match ty.sty {
-                    ty::TypeVariants::TyRef(..) => self.demand_suptype(pat.span, expected, pat_ty),
-                    _ => self.demand_autoderef(pat, expected,
-                                               &mut def_bm, |t| self.demand_suptype_diag(pat.span, t, pat_ty)),
-                }
+                self.demand_autoderef(pat, expected,
+                                      &mut def_bm, |t| self.demand_suptype_diag(pat.span, t, pat_ty));
 
                 pat_ty
             }
