@@ -377,58 +377,66 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 }
             }
             PatKind::Slice(ref before, ref slice, ref after) => {
+                let mut inner_ty = tcx.mk_ty(ty::TyError);
+                let mut slice_ty = tcx.mk_ty(ty::TyError);
+                let mut expected_ty = tcx.mk_ty(ty::TyError);
                 // TODO
-                let expected_ty = self.structurally_resolved_type(pat.span, expected);
-                let (inner_ty, slice_ty) = match expected_ty.sty {
-                    ty::TyArray(inner_ty, size) => {
-                        let size = size.unwrap_usize(tcx);
-                        let min_len = before.len() as u64 + after.len() as u64;
-                        if slice.is_none() {
-                            if min_len != size {
-                                struct_span_err!(
-                                    tcx.sess, pat.span, E0527,
-                                    "pattern requires {} elements but array has {}",
-                                    min_len, size)
-                                    .span_label(pat.span, format!("expected {} elements",size))
-                                    .emit();
-                            }
-                            (inner_ty, tcx.types.err)
-                        } else if let Some(rest) = size.checked_sub(min_len) {
-                            (inner_ty, tcx.mk_array(inner_ty, rest))
-                        } else {
-                            struct_span_err!(tcx.sess, pat.span, E0528,
-                                    "pattern requires at least {} elements but array has {}",
-                                    min_len, size)
-                                .span_label(pat.span,
-                                    format!("pattern cannot match array of {} elements", size))
-                                .emit();
-                            (inner_ty, tcx.types.err)
-                        }
-                    }
-                    ty::TySlice(inner_ty) => (inner_ty, expected_ty),
-                    _ => {
-                        if !expected_ty.references_error() {
-                            let mut err = struct_span_err!(
-                                tcx.sess, pat.span, E0529,
-                                "expected an array or slice, found `{}`",
-                                expected_ty);
-                            if let ty::TyRef(_, ty, _) = expected_ty.sty {
-                                match ty.sty {
-                                    ty::TyArray(..) | ty::TySlice(..) => {
-                                        err.help("the semantics of slice patterns changed \
-                                                  recently; see issue #23121");
-                                    }
-                                    _ => {}
+                self.demand_autoderef(pat, expected, &mut def_bm, |t| {
+                    expected_ty = self.structurally_resolved_type(pat.span, t);
+                    let (inner, slice) = match expected_ty.sty {
+                        ty::TyArray(inner_ty, size) => {
+                            let size = size.unwrap_usize(tcx);
+                            let min_len = before.len() as u64 + after.len() as u64;
+                            if slice.is_none() {
+                                if min_len != size {
+                                    let mut err = struct_span_err!(
+                                        tcx.sess, pat.span, E0527,
+                                        "pattern requires {} elements but array has {}",
+                                        min_len, size);
+                                    err.span_label(pat.span, format!("expected {} elements",size));
+                                    return Some(err);
                                 }
+                                (inner_ty, tcx.types.err)
+                            } else if let Some(rest) = size.checked_sub(min_len) {
+                                (inner_ty, tcx.mk_array(inner_ty, rest))
+                            } else {
+                                let mut err = struct_span_err!(tcx.sess, pat.span, E0528,
+                                                           "pattern requires at least {} elements but array has {}",
+                                                           min_len, size);
+                                err.span_label(pat.span,
+                                               format!("pattern cannot match array of {} elements", size));
+                                return Some(err);
                             }
-
-                            err.span_label( pat.span,
-                                format!("pattern cannot match with input type `{}`", expected_ty)
-                            ).emit();
                         }
-                        (tcx.types.err, tcx.types.err)
-                    }
-                };
+                        ty::TySlice(inner_ty) => (inner_ty, expected_ty),
+                        _ => {
+                            if !expected_ty.references_error() {
+                                let mut err = struct_span_err!(
+                                    tcx.sess, pat.span, E0529,
+                                    "expected an array or slice, found `{}`",
+                                    expected_ty);
+                                if let ty::TyRef(_, ty, _) = expected_ty.sty {
+                                    match ty.sty {
+                                        ty::TyArray(..) | ty::TySlice(..) => {
+                                            err.help("the semantics of slice patterns changed \
+                                                    recently; see issue #23121");
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                err.span_label( pat.span,
+                                                format!("pattern cannot match with input type `{}`", expected_ty));
+
+                                return Some(err);
+                            }
+                            (tcx.types.err, tcx.types.err)
+                        }
+                    };
+                    inner_ty = inner;
+                    slice_ty = slice;
+                    None
+                });
 
                 for elt in before {
                     self.check_pat_walk(&elt, inner_ty, def_bm, true);
