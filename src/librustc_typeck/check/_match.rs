@@ -18,6 +18,7 @@ use rustc::ty::{self, Ty, TypeFoldable};
 use check::{FnCtxt, Expectation, Diverges, Needs};
 use check::coercion::CoerceMany;
 use util::nodemap::FxHashMap;
+use errors::DiagnosticBuilder;
 
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::cmp;
@@ -28,17 +29,17 @@ use syntax_pos::Span;
 
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     fn demand_autoderef(&self, pat: &hir::Pat,
-                        expected: Ty<'tcx>, actual: Ty<'tcx>,
-                        def_bm: &mut ty::BindingMode, subtype: bool) {
+                        expected: Ty<'tcx>,
+                        def_bm: &mut ty::BindingMode,
+                        mut unify: impl FnMut(Ty<'tcx>) -> Option<DiagnosticBuilder<'tcx>>) {
         let mut pat_adjustments = vec![];
         let mut exp_ty = self.resolve_type_vars_with_obligations(&expected);
         let mut autoderef = self.autoderef(pat.span, exp_ty);
-        info!("demand_autoderef expected = {:?}, actual = {:?}", exp_ty, actual);
+        autoderef.next();
+        info!("demand_autoderef expected = {:?}", exp_ty);
 
         loop {
-            let result =
-                if subtype { self.demand_suptype_diag(pat.span, exp_ty, actual) }
-            else { self.demand_eqtype_diag(pat.span, exp_ty, actual) };
+            let result = unify(exp_ty);
             match result {
                 None => {
                     info!("demand_autoderef succeed");
@@ -157,7 +158,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // that's equivalent to there existing a LUB.
                 match ty.sty {
                     ty::TypeVariants::TyRef(..) => self.demand_suptype(pat.span, expected, pat_ty),
-                    _ => self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, true),
+                    _ => self.demand_autoderef(pat, expected,
+                                               &mut def_bm, |t| self.demand_suptype_diag(pat.span, t, pat_ty)),
                 }
 
                 pat_ty
@@ -207,8 +209,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 let common_type = self.resolve_type_vars_if_possible(&lhs_ty);
 
                 // subtyping doesn't matter here, as the value is some kind of scalar
-                self.demand_autoderef(pat, expected, lhs_ty, &mut def_bm, false);
-                self.demand_autoderef(pat, expected, rhs_ty, &mut def_bm, false);
+                self.demand_autoderef(pat, expected, &mut def_bm, |t| self.demand_eqtype_diag(pat.span, t, lhs_ty));
+                self.demand_autoderef(pat, expected, &mut def_bm, |t| self.demand_eqtype_diag(pat.span, t, rhs_ty));
                 common_type
             }
             PatKind::Binding(ba, var_id, _, ref sub) => {
@@ -269,23 +271,28 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 self.check_pat_struct(pat, qpath, fields, etc, expected, def_bm)
             }
             PatKind::Tuple(ref elements, ddpos) => {
-                let mut expected_len = elements.len();
-                if ddpos.is_some() {
-                    // Require known type only when `..` is present
-                    if let ty::TyTuple(ref tys) =
-                            self.structurally_resolved_type(pat.span, expected).sty {
-                        expected_len = tys.len();
+                let mut pat_ty = tcx.mk_ty(ty::TyError);
+                let mut max_len = 0;
+                let mut element_tys = ty::Slice::empty();
+                self.demand_autoderef(pat, expected, &mut def_bm, |t| {
+                    let mut expected_len = elements.len();
+                    if ddpos.is_some() {
+                        // Require known type only when `..` is present
+                        if let ty::TyTuple(ref tys) =
+                            self.structurally_resolved_type(pat.span, t).sty {
+                                 expected_len = tys.len();
+                             }
                     }
-                }
-                let max_len = cmp::max(expected_len, elements.len());
+                    max_len = cmp::max(expected_len, elements.len());
 
-                let element_tys_iter = (0..max_len).map(|_| self.next_ty_var(
-                    // FIXME: MiscVariable for now, obtaining the span and name information
-                    //       from all tuple elements isn't trivial.
-                    TypeVariableOrigin::TypeInference(pat.span)));
-                let element_tys = tcx.mk_type_list(element_tys_iter);
-                let pat_ty = tcx.mk_ty(ty::TyTuple(element_tys));
-                self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, false);
+                    let element_tys_iter = (0..max_len).map(|_| self.next_ty_var(
+                                 // FIXME: MiscVariable for now, obtaining the span and name information
+                                 //       from all tuple elements isn't trivial.
+                                 TypeVariableOrigin::TypeInference(pat.span)));
+                    element_tys = tcx.mk_type_list(element_tys_iter);
+                    pat_ty = tcx.mk_ty(ty::TyTuple(element_tys));
+                    self.demand_eqtype_diag(pat.span, t, pat_ty)
+                });
                 for (i, elem) in elements.iter().enumerate_and_adjust(max_len, ddpos) {
                     self.check_pat_walk(elem, &element_tys[i], def_bm, true);
                 }
@@ -299,7 +306,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                     // Here, `demand::subtype` is good enough, but I don't
                     // think any errors can be introduced by using
                     // `demand::eqtype`.
-                    self.demand_autoderef(pat, expected, uniq_ty, &mut def_bm, false);
+                    self.demand_autoderef(pat, expected, &mut def_bm, |t| self.demand_eqtype_diag(pat.span, t, uniq_ty));
                     self.check_pat_walk(&inner, inner_ty, def_bm, true);
                     uniq_ty
                 } else {
@@ -719,7 +726,7 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
         };
 
         // Type check the path.
-        self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, false);
+        self.demand_autoderef(pat, expected, &mut def_bm, |t| self.demand_eqtype_diag(pat.span, t, pat_ty));
 
         // Type check subpatterns.
         self.check_struct_pat_fields(pat_ty, pat.id, pat.span, variant, fields, etc, def_bm);
@@ -762,7 +769,7 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
         match def {
             Def::Const(..) | Def::AssociatedConst(..) =>
                 self.demand_suptype(pat.span, expected, pat_ty),
-            _ => self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, true)
+            _ => self.demand_autoderef(pat, expected, &mut def_bm, |t| self.demand_suptype_diag(pat.span, t, pat_ty))
         }
         pat_ty
     }
@@ -815,7 +822,7 @@ https://doc.rust-lang.org/reference/types.html#trait-objects");
         let pat_ty = pat_ty.fn_sig(tcx).output();
         let pat_ty = pat_ty.no_late_bound_regions().expect("expected fn type");
 
-        self.demand_autoderef(pat, expected, pat_ty, &mut def_bm, false);
+        self.demand_autoderef(pat, expected, &mut def_bm, |t| self.demand_eqtype_diag(pat.span, t, pat_ty));
 
         // Type check subpatterns.
         if subpats.len() == variant.fields.len() ||
